@@ -19,6 +19,21 @@ def _normalize_tokenizer_vocab(vocab):
     return {k.replace("Ġ", "▁"): v for k, v in vocab.items()}
 
 
+def resolve_teacher_tokenizer(distiller):
+    """Teacher tokenizer for DSKDv2 (singular) or multi-teacher distiller (dict)."""
+    tok = getattr(distiller, "teacher_tokenizer", None)
+    if tok is not None:
+        return tok
+    teacher_tokenizers = getattr(distiller, "teacher_tokenizers", None)
+    if not teacher_tokenizers:
+        return None
+    teacher_key = getattr(distiller, "teacher_model_type", None)
+    if teacher_key is None:
+        args = getattr(distiller, "args", None)
+        teacher_key = getattr(args, "teacher_model_type", None) if args else None
+    return teacher_tokenizers.get(teacher_key) if teacher_key else None
+
+
 def compute_vocab_overlap_stats(student_tokenizer, teacher_tokenizer):
     """Token-string overlap between student and teacher vocabularies (IMPACT W_{T->S} support).
 
@@ -60,7 +75,10 @@ def log_impact_vocab_overlap(
         return
 
     teacher_key = getattr(distiller, "teacher_model_type", None)
-    teacher_tok = distiller.teacher_tokenizers.get(teacher_key) if teacher_key else None
+    if teacher_key is None:
+        args = getattr(distiller, "args", None)
+        teacher_key = getattr(args, "teacher_model_type", None) if args else None
+    teacher_tok = resolve_teacher_tokenizer(distiller)
     student_tok = getattr(distiller, "student_tokenizer", None)
     if teacher_tok is None or student_tok is None:
         return
@@ -591,7 +609,7 @@ class IMPACTModule(nn.Module):
     def _ensure_initialized(self, distiller):
         if self._initialized:
             return
-        teacher_tok = distiller.teacher_tokenizers.get(distiller.teacher_model_type)
+        teacher_tok = resolve_teacher_tokenizer(distiller)
         if teacher_tok is None:
             return
         log_impact_vocab_overlap(
