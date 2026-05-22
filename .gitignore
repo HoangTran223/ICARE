@@ -1,0 +1,13 @@
+outputs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.cache/
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Large artifacts (download separately)
+# model_hub/
+# data/

@@ -1,0 +1,14 @@
+# Optional: one-shot conda env (same as install_icare.sh).
+#   conda env create -f environment.yml
+#   conda activate icare
+name: icare
+channels:
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.13
+  - cuda-nvcc=12.4
+  - pip
+  - pip:
+      - -r requirements.txt
