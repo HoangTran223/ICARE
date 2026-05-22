@@ -304,6 +304,45 @@ def normalize_choose_align(choose_align):
     return "BI"
 
 
+def compute_alp_kd_attention_weights(student_hidden_states, teacher_hidden_states, W_proj, L_T, L_S):
+    """ALP-KD layer attention (GLMKD ``ALP_KD.inter_loss``).
+
+    For each student layer, softmax over all teacher layers using dot-product
+    scores between the first-token (CLS) hidden states. Teacher CLS is projected
+    to student dim via ``W_proj`` (cross-tokenizer), matching GLMKD when hidden
+    sizes differ.
+
+    Returns:
+        alpha: [B, L_S, L_T] with sum over L_T = 1 per student layer.
+    """
+    device = student_hidden_states[1].device
+    W = W_proj.to(device=device, dtype=torch.float32)
+    s_cls = torch.stack(
+        [student_hidden_states[m][:, 0, :].float() for m in range(1, L_S + 1)],
+        dim=1,
+    )
+    t_cls = torch.stack(
+        [(teacher_hidden_states[l][:, 0, :].float() @ W) for l in range(1, L_T + 1)],
+        dim=1,
+    )
+    scores = torch.bmm(s_cls, t_cls.transpose(1, 2))
+    return F.softmax(scores, dim=-1)
+
+
+def fuse_teacher_hidden_by_attention(teacher_hidden_states, alpha_bt, L_T):
+    """Fused teacher hidden H^C = sum_l alpha_l * H_T^l (ALP-KD Eq. 5–6 style).
+
+    Args:
+        alpha_bt: [B, L_T] weights for one student layer.
+    """
+    fused = None
+    for l in range(1, L_T + 1):
+        h = teacher_hidden_states[l]
+        w = alpha_bt[:, l - 1].view(-1, 1, 1).to(device=h.device, dtype=h.dtype)
+        fused = h * w if fused is None else fused + h * w
+    return fused
+
+
 def build_impact_alignment_pairs(
     choose_align,
     choose_layer,
@@ -322,11 +361,9 @@ def build_impact_alignment_pairs(
     choose_align:
       - BI: top-K teacher layers (choose_layer), BI/PPL softmax weights, g(l) depth map
       - 1-1: every student layer m paired with teacher ceil(m*L_T/L_S), uniform 1/L_S
-      - 1-all: last student layer L_S paired with every teacher layer, uniform 1/L_T
-        (ICARE align ablation / simplified ALP-KD one-to-all)
+      - 1-all: not used here — handled in ``compute_impact_loss`` via ALP-KD attention
     """
     align_mode = normalize_choose_align(choose_align)
-    device = teacher_hidden_states[1].device
     pairs = []
 
     if align_mode == "1-1":
@@ -337,11 +374,10 @@ def build_impact_alignment_pairs(
         return pairs, align_mode, None
 
     if align_mode == "1-all":
-        m = L_S
-        weight = 1.0 / max(L_T, 1)
-        for l in range(1, L_T + 1):
-            pairs.append((l, m, weight))
-        return pairs, align_mode, None
+        raise RuntimeError(
+            "choose_align=1-all uses ALP-KD fused teacher states in compute_impact_loss; "
+            "do not call build_impact_alignment_pairs for 1-all."
+        )
 
     selected, alpha, layer_mode, _ = select_teacher_layers_and_weights(
         choose_layer,
@@ -487,6 +523,28 @@ def compute_student_increments(student_hidden, student_mask):
     return increments
 
 
+def _log_alp_kd_alignment(alpha, L_S, L_T):
+    """Log ALP-KD attention (sample student layers, batch 0)."""
+    try:
+        from utils import log_rank
+    except ImportError:
+        return
+    b0 = 0
+    samples = sorted({1, max(1, L_S // 2), L_S})
+    parts = []
+    for m in samples:
+        w = alpha[b0, m - 1].detach().float().cpu().tolist()
+        ranked = sorted(enumerate(w, start=1), key=lambda x: -x[1])
+        top5 = [(l, round(a, 4)) for l, a in ranked[:5]]
+        parts.append(f"s{m}:{top5}")
+    log_rank(
+        "[IMPACT align] mode=1-all (ALP-KD, GLMKD ALP_KD) L_S={} L_T={} num_student_layers={} "
+        "attn_softmax_over_teacher batch0_samples: {}".format(
+            L_S, L_T, L_S, "; ".join(parts)
+        )
+    )
+
+
 def compute_impact_loss(student_hidden_states, teacher_hidden_states,
                        student_offsets_batch, teacher_offsets_batch,
                        W_proj, student_mask, teacher_mask,
@@ -510,7 +568,7 @@ def compute_impact_loss(student_hidden_states, teacher_hidden_states,
         top_k: number of teacher layers to select (BI align only)
         bi_tau: temperature for BI score softmax (BI align only)
         choose_layer: teacher layer selection when choose_align=BI
-        choose_align: BI | 1-1 | 1-all
+        choose_align: BI | 1-1 | 1-all (1-all = ALP-KD attention fusion)
         L_T: number of teacher layers (excluding embedding)
         L_S: number of student layers (excluding embedding)
 
@@ -521,6 +579,40 @@ def compute_impact_loss(student_hidden_states, teacher_hidden_states,
         L_T = len(teacher_hidden_states) - 1
     if L_S is None:
         L_S = len(student_hidden_states) - 1
+
+    align_mode = normalize_choose_align(choose_align)
+    if align_mode == "1-all":
+        if W_proj is None:
+            raise ValueError("ALP-KD (choose_align=1-all) requires vocabulary projection W_proj")
+        alpha = compute_alp_kd_attention_weights(
+            student_hidden_states, teacher_hidden_states, W_proj, L_T, L_S
+        )
+        if log_selection:
+            _log_alp_kd_alignment(alpha, L_S, L_T)
+
+        device = student_hidden_states[0].device
+        total_loss = torch.tensor(0.0, device=device)
+        mask_float = student_mask.float()
+        N = mask_float.sum(dim=1).clamp(min=1)
+        layer_weight = 1.0 / max(L_S, 1)
+
+        for m in range(1, L_S + 1):
+            s_hidden = student_hidden_states[m]
+            t_fused = fuse_teacher_hidden_by_attention(
+                teacher_hidden_states, alpha[:, m - 1, :], L_T
+            )
+            delta_T = compute_teacher_increments_batch(
+                student_offsets_batch, teacher_offsets_batch,
+                t_fused, W_proj, student_mask, teacher_mask
+            )
+            delta_S = compute_student_increments(s_hidden, student_mask)
+            cos_sim = F.cosine_similarity(
+                delta_S.float(), delta_T.float(), dim=-1, eps=1e-6
+            )
+            cos_loss = (1.0 - cos_sim) * mask_float
+            layer_loss = (cos_loss.sum(dim=1) / N).mean()
+            total_loss = total_loss + layer_weight * layer_loss
+        return total_loss
 
     pairs, align_mode, layer_mode = build_impact_alignment_pairs(
         choose_align,

@@ -198,6 +198,24 @@ def add_hp_args(parser: argparse.ArgumentParser):
                        help="Temperature for BI score softmax weighting")
     group.add_argument("--impact-lambda-reg", type=float, default=1.0,
                        help="Regularization strength for vocabulary projection")
+    group.add_argument(
+        "--impact-choose-layer",
+        "--choose-layer",
+        dest="impact_choose_layer",
+        type=str,
+        default="BI",
+        choices=["BI", "random", "first", "last", "PPL"],
+        help="Teacher layer selection when impact choose_align=BI",
+    )
+    group.add_argument(
+        "--impact-choose-align",
+        "--choose-align",
+        dest="impact_choose_align",
+        type=str,
+        default="BI",
+        choices=["BI", "1-1", "1-all"],
+        help="IMPACT layer alignment: BI, 1-1 (depth-ratio), 1-all (ALP-KD attention, GLMKD)",
+    )
 
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '

@@ -168,7 +168,8 @@ def add_hp_args(parser: argparse.ArgumentParser):
         default="BI",
         choices=["BI", "1-1", "1-all"],
         help="Layer alignment for IMPACT BPIA: BI (top-K + BI weights + depth), "
-        "1-1 (all student layers, depth-ratio, uniform), 1-all (ALP-KD: last student layer, all teacher layers, uniform)",
+        "1-1 (each student layer -> one teacher layer by depth ratio, uniform 1/L_S), "
+        "1-all (ALP-KD/GLMKD: each student layer -> softmax attention over all teacher layers, fused hidden)",
     )
 
     group.add_argument('--warmup-iters', type=int, default=0,
