@@ -1,0 +1,11 @@
+setup.py
+tokenkit/__init__.py
+tokenkit/align.py
+tokenkit/byteify.py
+tokenkit/constants.py
+tokenkit/model_kinds.py
+tokenkit/utils.py
+tokenkit.egg-info/PKG-INFO
+tokenkit.egg-info/SOURCES.txt
+tokenkit.egg-info/dependency_links.txt
+tokenkit.egg-info/top_level.txt
