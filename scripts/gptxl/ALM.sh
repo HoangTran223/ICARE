@@ -1,5 +1,5 @@
 #!/bin/bash
-GPUS=(0)
+GPUS=(1)
 export CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${GPUS[*]}")
 
 MASTER_ADDR=localhost
@@ -33,9 +33,9 @@ DATA_DIR="${BASE_PATH}/data/dolly/"
 
 # task
 TASK="ALM"
-BATCH_SIZE=4
+BATCH_SIZE=8
 LR=0.001
-GRAD_ACC=2
+GRAD_ACC=1
 EVAL_BATCH_SIZE=16
 EPOCH=15
 KD_TEMP=1.0
@@ -48,6 +48,7 @@ ALM_BINARIZATION_TEMP=100.0
 ALM_BIAS_THRESHOLD=0.1
 ALM_LOSS_WEIGHT=3.0
 ALM_MODE="merge_by_space_prob+append_space"
+MULTITASK_AGG="approx_gradmag_preserve_mag"
 
 # length
 MAX_LENGTH=512
@@ -106,6 +107,7 @@ OPTS+=" --alm-binarization-temp ${ALM_BINARIZATION_TEMP}"
 OPTS+=" --alm-bias-threshold ${ALM_BIAS_THRESHOLD}"
 OPTS+=" --alm-loss-weight ${ALM_LOSS_WEIGHT}"
 OPTS+=" --alm-mode ${ALM_MODE}"
+OPTS+=" --multitask-aggregation-fn ${MULTITASK_AGG}"
 
 # length
 OPTS+=" --max-length ${MAX_LENGTH}"
@@ -144,7 +146,7 @@ OPTS+=" --temperature 1.0"
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True
 export TF_CPP_MIN_LOG_LEVEL=3
-export PYTHONPATH=${BASE_PATH}:${BASE_PATH}/ALM/tokenkit-main:${BASE_PATH}/ALM
+export PYTHONPATH=${BASE_PATH}:${BASE_PATH}/ALM/tokenkit-main
 CMD="torchrun ${DISTRIBUTED_ARGS} ${BASE_PATH}/code/distillation_alm.py ${OPTS}"
 
 ${CMD} 2>&1 | tee "${SAVE_PATH}/train.log"

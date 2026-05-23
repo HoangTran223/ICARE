@@ -50,6 +50,7 @@ ALM_BINARIZATION_TEMP=100.0
 ALM_BIAS_THRESHOLD=0.1
 ALM_LOSS_WEIGHT=3.0
 ALM_MODE="merge_by_space_prob+append_space"
+MULTITASK_AGG="approx_gradmag_preserve_mag"
 
 # IMPACT hyperparameters
 IMPACT_LAMBDA=10.0
@@ -114,7 +115,7 @@ OPTS+=" --alm-binarization-temp ${ALM_BINARIZATION_TEMP}"
 OPTS+=" --alm-bias-threshold ${ALM_BIAS_THRESHOLD}"
 OPTS+=" --alm-loss-weight ${ALM_LOSS_WEIGHT}"
 OPTS+=" --alm-mode ${ALM_MODE}"
-
+OPTS+=" --multitask-aggregation-fn ${MULTITASK_AGG}"
 # IMPACT
 OPTS+=" --impact-lambda ${IMPACT_LAMBDA}"
 OPTS+=" --impact-top-k ${IMPACT_TOP_K}"

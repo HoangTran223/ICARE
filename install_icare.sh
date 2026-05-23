@@ -47,9 +47,24 @@ conda install -y -c nvidia cuda-nvcc=12.4
 echo "Installing Python packages from requirements.txt..."
 pip install -r "${REPO_ROOT}/requirements.txt"
 
+# ALM: vendored tokenkit at ALM/tokenkit-main (not PyPI `pip install tokenkit`)
+if [[ ! -d "${REPO_ROOT}/ALM/tokenkit-main" ]]; then
+  for _alm_src in "${REPO_ROOT}/ICARE_final/ALM" "/mnt/hungpv/projects/ALM"; do
+    if [[ -d "${_alm_src}/tokenkit-main" ]]; then
+      ln -sfn "${_alm_src}" "${REPO_ROOT}/ALM"
+      echo "Linked ALM -> ${_alm_src}"
+      break
+    fi
+  done
+fi
 if [[ -d "${REPO_ROOT}/ALM/tokenkit-main" ]]; then
-  echo "Installing tokenkit (ALM cross-tokenizer alignment)..."
-  pip install -e "${REPO_ROOT}/ALM/tokenkit-main" --no-deps 2>/dev/null || true
+  if pip show tokenkit >/dev/null 2>&1; then
+    _tk="$(python -c "import tokenkit; print(getattr(tokenkit,'__file__',''))" 2>/dev/null || true)"
+    if [[ -n "${_tk}" && "${_tk}" != *"${REPO_ROOT}/ALM/tokenkit-main"* ]]; then
+      pip uninstall -y tokenkit
+    fi
+  fi
+  pip install -e "${REPO_ROOT}/ALM/tokenkit-main" --no-deps
 fi
 
 echo ""

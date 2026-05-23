@@ -20,17 +20,26 @@ def uses_gradmag(multitask_aggregation_fn: str | None) -> bool:
 def get_last_layer_params(model: nn.Module, model_type: str) -> List[torch.nn.Parameter]:
     """Last transformer block only (tokenkit get_layer_n_mask(..., -1); gpt2: transformer.h[-1])."""
     if model_type in ("gpt2", "gptj"):
-        return list(model.transformer.h[-1].parameters())
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return list(model.model.layers[-1].parameters())
-    if hasattr(model, "transformer") and hasattr(model.transformer, "layers"):
-        return list(model.transformer.layers[-1].parameters())
-    if hasattr(model, "gpt_neox") and hasattr(model.gpt_neox, "layers"):
-        return list(model.gpt_neox.layers[-1].parameters())
-    raise ValueError(
-        f"Cannot resolve last-layer parameters for model_type={model_type!r}. "
-        "Extend get_last_layer_params in code/alm_multitask.py."
-    )
+        layer_params = list(model.transformer.h[-1].parameters())
+    elif hasattr(model, "model") and hasattr(model.model, "layers"):
+        layer_params = list(model.model.layers[-1].parameters())
+    elif hasattr(model, "transformer") and hasattr(model.transformer, "layers"):
+        layer_params = list(model.transformer.layers[-1].parameters())
+    elif hasattr(model, "gpt_neox") and hasattr(model.gpt_neox, "layers"):
+        layer_params = list(model.gpt_neox.layers[-1].parameters())
+    else:
+        raise ValueError(
+            f"Cannot resolve last-layer parameters for model_type={model_type!r}. "
+            "Extend get_last_layer_params in code/alm_multitask.py."
+        )
+    # LoRA / frozen base weights: autograd.grad requires every input to require grad.
+    trainable = [p for p in layer_params if p.requires_grad]
+    if not trainable:
+        raise ValueError(
+            f"No trainable parameters in last layer for model_type={model_type!r}. "
+            "GradMag needs at least one trainable param in the last block."
+        )
+    return trainable
 
 
 def compute_global_grad_norm(grads: Sequence[torch.Tensor | None]) -> torch.Tensor:

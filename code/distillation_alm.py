@@ -35,11 +35,8 @@ from rouge_metric import compute_metrics
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOKENKIT_PATH = os.path.join(BASE_DIR, "ALM", "tokenkit-main")
-ALM_PATH = os.path.join(BASE_DIR, "ALM")
 if TOKENKIT_PATH not in sys.path:
     sys.path.insert(0, TOKENKIT_PATH)
-if ALM_PATH not in sys.path:
-    sys.path.insert(0, ALM_PATH)
 
 from pathlib import Path
 
@@ -48,7 +45,6 @@ from tokenkit.byteify import load_byteify_tokenizer
 from tokenkit.align import get_unconstrained_alignments, get_unbiased_alignments
 from tokenkit import utils as tokenkit_utils
 from alm_multitask import uses_gradmag
-from pytorch_tokenizer_aligner import TokenizerAlignerCollator
 
 torch.set_num_threads(4)
 
