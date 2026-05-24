@@ -192,6 +192,16 @@ def add_hp_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="RAIL_KD: log resampled teacher layer indices each refresh",
     )
+    group.add_argument(
+        "--impact-rail-kd-has-embed",
+        action="store_true",
+        help="RAIL_KD: include teacher embedding (layer 0) in hook list (GLMKD rail_kd_has_embed)",
+    )
+    group.add_argument(
+        "--impact-rail-kd-has-final",
+        action="store_true",
+        help="RAIL_KD: include teacher final output in hook list (GLMKD rail_kd_has_final)",
+    )
 
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '

@@ -220,6 +220,8 @@ def add_hp_args(parser: argparse.ArgumentParser):
     group.add_argument("--impact-rail-kd-iters", type=int, default=0)
     group.add_argument("--impact-rail-kd-no-random", action="store_true")
     group.add_argument("--impact-rail-kd-show-layers", action="store_true")
+    group.add_argument("--impact-rail-kd-has-embed", action="store_true")
+    group.add_argument("--impact-rail-kd-has-final", action="store_true")
 
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '

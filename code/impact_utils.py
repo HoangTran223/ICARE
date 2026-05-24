@@ -314,43 +314,91 @@ def criterion_supports_rail_kd_align(criterion_name):
     )
 
 
-def sample_rail_kd_teacher_layers(L_T, L_S, seed=None, no_random=False):
-    """GLMKD ``RAIL_KD.get_teacher_hook``: sorted random teacher layers for 1:1 student pairing.
+def sample_rail_kd_teacher_layers(
+    L_T,
+    L_S,
+    seed=None,
+    no_random=False,
+    has_embed=False,
+    has_final=False,
+):
+    """GLMKD ``RAIL_KD.get_teacher_hook`` teacher layer indices (HF hidden_states index).
 
-    Samples ``min(L_S - 1, L_T)`` distinct indices from ``{1, ..., L_T}`` (same count rule as
-    ``random.sample(range(1, teacher_num_layers), num_layers - 1)``), then pairs student
-    layer ``m`` with the ``m``-th sampled teacher layer (``m = 1 .. L_S``), holding the last
-    teacher index for any extra student depth when ``L_S`` exceeds the sample size.
+    Matches ``distill_model.RAIL_KD``:
+      - ``random.sample(range(1, teacher_num_layers), num_layers - 1)`` then ``sort()``
+      - ``teacher_num_layers`` = # teacher transformer blocks (= ``L_T`` here)
+      - pool is ``{1, ..., L_T - 1}`` (upper bound exclusive, same as GLMKD)
+      - count = ``L_S - 1`` (not ``L_S``); optional embed inserts ``0``, optional final adds output hook
+
+    Returns sorted teacher indices used for intermediate ``layernorm_output`` hooks.
     """
     if L_T < 1 or L_S < 1:
         return [1]
 
-    n_sample = min(max(L_S - 1, 1), L_T)
+    teacher_num_layers = L_T
+    num_layers = L_S
+    n_sample = max(num_layers - 1, 1)
+
     if no_random:
-        step = max(L_T // max(L_S, 1), 1)
-        layers = [min(1 + i * step, L_T) for i in range(n_sample)]
+        layers_per_block = max(int(teacher_num_layers / max(num_layers, 1)), 1)
+        layers = list(range(0, teacher_num_layers + 1, layers_per_block))[1:-1]
+        layers = [int(i) for i in layers if 0 < i < teacher_num_layers]
+        if len(layers) < n_sample:
+            pad = layers[-1] if layers else 1
+            layers = layers + [pad] * (n_sample - len(layers))
+        layers = layers[:n_sample]
     else:
+        pool = list(range(1, teacher_num_layers))
+        if not pool:
+            pool = [1]
         rng = random.Random(seed)
-        pool = list(range(1, L_T + 1))
-        if len(pool) >= n_sample:
-            layers = sorted(rng.sample(pool, n_sample))
-        else:
-            layers = sorted(rng.choices(pool, k=n_sample))
+        k = min(n_sample, len(pool))
+        layers = sorted(rng.sample(pool, k))
 
-    if len(layers) < L_S:
-        layers = layers + [layers[-1]] * (L_S - len(layers))
-    return layers[:L_S]
+    if has_embed:
+        layers = [0] + layers
+    if has_final:
+        layers = layers + [teacher_num_layers]
+    return layers
 
 
-def build_rail_kd_alignment_pairs(L_T, L_S, seed=None, no_random=False):
-    """Build (teacher, student, weight) triples for ``choose_align=1-random`` (RAIL_KD)."""
+def rail_kd_num_pairs(L_S, has_final=False):
+    """Number of (student, teacher) reps zipped in GLMKD ``inter_loss`` (layer-wise mode)."""
+    if has_final:
+        return L_S
+    return max(L_S - 1, 1)
+
+
+def build_rail_kd_alignment_pairs(
+    L_T,
+    L_S,
+    seed=None,
+    no_random=False,
+    has_embed=False,
+    has_final=False,
+):
+    """Build BPIA pairs for ``choose_align=1-random`` using GLMKD RAIL-KD layer matching.
+
+    GLMKD pairs the first ``L_S - 1`` student ``layernorm_output`` hooks (student layers
+    ``1 .. L_S-1`` in HF ``hidden_states``) with the sorted random teacher hooks — not all
+    ``L_S`` student blocks unless ``rail_kd_has_final`` is enabled.
+    """
     teacher_layers = sample_rail_kd_teacher_layers(
-        L_T, L_S, seed=seed, no_random=no_random
+        L_T,
+        L_S,
+        seed=seed,
+        no_random=no_random,
+        has_embed=has_embed,
+        has_final=has_final,
     )
-    weight = 1.0 / max(L_S, 1)
-    pairs = [
-        (teacher_layers[m - 1], m, weight) for m in range(1, L_S + 1)
-    ]
+    n_pairs = rail_kd_num_pairs(L_S, has_final=has_final)
+    t_start = 1 if has_embed else 0
+    weight = 1.0 / max(n_pairs, 1)
+    pairs = []
+    for i in range(n_pairs):
+        student_m = i + 1
+        teacher_l = teacher_layers[t_start + i]
+        pairs.append((teacher_l, student_m, weight))
     return pairs, "1-random", "RAIL_KD"
 
 
@@ -407,6 +455,8 @@ def build_impact_alignment_pairs(
     random_seed=None,
     rail_teacher_layers=None,
     rail_kd_no_random=False,
+    rail_kd_has_embed=False,
+    rail_kd_has_final=False,
 ):
     """Build (teacher_layer, student_layer, weight) triples for BPIA aggregation.
 
@@ -421,15 +471,21 @@ def build_impact_alignment_pairs(
 
     if align_mode == "1-random":
         if rail_teacher_layers is not None:
-            weight = 1.0 / max(L_S, 1)
+            n_pairs = rail_kd_num_pairs(L_S, has_final=rail_kd_has_final)
+            t_start = 1 if rail_kd_has_embed else 0
+            weight = 1.0 / max(n_pairs, 1)
             layers = list(rail_teacher_layers)
-            if len(layers) < L_S:
-                layers = layers + [layers[-1]] * (L_S - len(layers))
-            layers = layers[:L_S]
-            pairs = [(layers[m - 1], m, weight) for m in range(1, L_S + 1)]
+            pairs = [
+                (layers[t_start + i], i + 1, weight) for i in range(n_pairs)
+            ]
             return pairs, align_mode, "RAIL_KD"
         return build_rail_kd_alignment_pairs(
-            L_T, L_S, seed=random_seed, no_random=rail_kd_no_random
+            L_T,
+            L_S,
+            seed=random_seed,
+            no_random=rail_kd_no_random,
+            has_embed=rail_kd_has_embed,
+            has_final=rail_kd_has_final,
         )
 
     if align_mode == "1-1":
@@ -618,7 +674,8 @@ def compute_impact_loss(student_hidden_states, teacher_hidden_states,
                        choose_layer="BI", choose_align="BI",
                        teacher_model=None, teacher_labels=None,
                        padding_id=-100, random_seed=None, log_selection=False,
-                       rail_teacher_layers=None, rail_kd_no_random=False):
+                       rail_teacher_layers=None, rail_kd_no_random=False,
+                       rail_kd_has_embed=False, rail_kd_has_final=False):
     """Compute the full IMPACT (BPIA) loss.
 
     L_BPIA = sum_pairs w * (1/N) * sum_i (1 - cos(Delta_S, Delta_T))
@@ -695,6 +752,8 @@ def compute_impact_loss(student_hidden_states, teacher_hidden_states,
         random_seed=random_seed,
         rail_teacher_layers=rail_teacher_layers,
         rail_kd_no_random=rail_kd_no_random,
+        rail_kd_has_embed=rail_kd_has_embed,
+        rail_kd_has_final=rail_kd_has_final,
     )
 
     if log_selection:
@@ -774,12 +833,15 @@ class IMPACTModule(nn.Module):
         self.rail_kd_epochs = int(getattr(args, "impact_rail_kd_epochs", 1))
         self.rail_kd_iters = int(getattr(args, "impact_rail_kd_iters", 0))
         self.rail_kd_no_random = bool(getattr(args, "impact_rail_kd_no_random", False))
+        self.rail_kd_has_embed = bool(getattr(args, "impact_rail_kd_has_embed", False))
+        self.rail_kd_has_final = bool(getattr(args, "impact_rail_kd_has_final", False))
         self.rail_kd_show_layers = bool(
             getattr(args, "impact_rail_kd_show_layers", False)
         )
+        self._rail_last_iter = -1
         self._rail_teacher_layers = None
         self._rail_last_epoch = -1
-        self._rail_last_iter_bucket = -1
+        self._rail_last_iter = -1
         self._rail_forward_step = 0
         self.padding_id = getattr(args, "padding_id", -100)
         self.random_seed = getattr(args, "seed", None)
@@ -807,7 +869,7 @@ class IMPACTModule(nn.Module):
         self._initialized = True
 
     def _maybe_resample_rail_layers(self, L_T, L_S, distiller):
-        """Resample RAIL_KD teacher layers (GLMKD: each epoch or every N iters)."""
+        """Resample RAIL_KD teacher layers — same schedule as GLMKD ``get_teacher_hook``."""
         train_epoch = int(
             getattr(getattr(distiller, "args", None), "current_train_epoch", 0)
         )
@@ -816,32 +878,41 @@ class IMPACTModule(nn.Module):
         )
         self._rail_forward_step += 1
         resample = self._rail_teacher_layers is None
-        bucket = (
-            global_step // max(self.rail_kd_iters, 1) if self.rail_kd_iters > 0 else 0
-        )
 
         if self.rail_kd_iters > 0:
-            if bucket != self._rail_last_iter_bucket:
+            # GLMKD: new hook when iteration % iters == 0 and iteration != last_iter
+            if (
+                global_step % self.rail_kd_iters == 0
+                and global_step != self._rail_last_iter
+            ):
                 resample = True
-                self._rail_last_iter_bucket = bucket
+            else:
+                resample = False if self._rail_teacher_layers is not None else True
         elif self.rail_kd_epochs > 0:
-            if train_epoch != self._rail_last_epoch:
+            # GLMKD: new hook when epoch % epochs == 0 and epoch != last_epoch
+            if (
+                train_epoch % self.rail_kd_epochs == 0
+                and train_epoch != self._rail_last_epoch
+            ):
                 resample = True
-                self._rail_last_epoch = train_epoch
+            else:
+                resample = False if self._rail_teacher_layers is not None else True
 
         if resample:
             if self.random_seed is None:
                 seed = None
-            elif self.rail_kd_iters > 0:
-                seed = int(self.random_seed) + train_epoch * 10007 + bucket
             else:
-                seed = int(self.random_seed) + train_epoch * 10007
+                seed = int(self.random_seed) + train_epoch * 10007 + global_step
             self._rail_teacher_layers = sample_rail_kd_teacher_layers(
                 L_T,
                 L_S,
                 seed=seed,
                 no_random=self.rail_kd_no_random,
+                has_embed=self.rail_kd_has_embed,
+                has_final=self.rail_kd_has_final,
             )
+            self._rail_last_epoch = train_epoch
+            self._rail_last_iter = global_step
             if self.rail_kd_show_layers:
                 try:
                     from utils import log_rank
@@ -887,6 +958,8 @@ class IMPACTModule(nn.Module):
             log_selection=not self._layer_select_logged,
             rail_teacher_layers=rail_layers,
             rail_kd_no_random=self.rail_kd_no_random,
+            rail_kd_has_embed=self.rail_kd_has_embed,
+            rail_kd_has_final=self.rail_kd_has_final,
         )
         self._layer_select_logged = True
         return loss
