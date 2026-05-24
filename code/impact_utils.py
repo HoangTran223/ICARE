@@ -19,6 +19,21 @@ def _normalize_tokenizer_vocab(vocab):
     return {k.replace("Ġ", "▁"): v for k, v in vocab.items()}
 
 
+def resolve_teacher_tokenizer(distiller):
+    """Teacher tokenizer for DSKDv2 (singular) or multi-teacher distiller (dict)."""
+    tok = getattr(distiller, "teacher_tokenizer", None)
+    if tok is not None:
+        return tok
+    teacher_tokenizers = getattr(distiller, "teacher_tokenizers", None)
+    if not teacher_tokenizers:
+        return None
+    teacher_key = getattr(distiller, "teacher_model_type", None)
+    if teacher_key is None:
+        args = getattr(distiller, "args", None)
+        teacher_key = getattr(args, "teacher_model_type", None) if args else None
+    return teacher_tokenizers.get(teacher_key) if teacher_key else None
+
+
 def compute_vocab_overlap_stats(student_tokenizer, teacher_tokenizer):
     """Token-string overlap between student and teacher vocabularies (IMPACT W_{T->S} support).
 
@@ -60,7 +75,10 @@ def log_impact_vocab_overlap(
         return
 
     teacher_key = getattr(distiller, "teacher_model_type", None)
-    teacher_tok = distiller.teacher_tokenizers.get(teacher_key) if teacher_key else None
+    if teacher_key is None:
+        args = getattr(distiller, "args", None)
+        teacher_key = getattr(args, "teacher_model_type", None) if args else None
+    teacher_tok = resolve_teacher_tokenizer(distiller)
     student_tok = getattr(distiller, "student_tokenizer", None)
     if teacher_tok is None or student_tok is None:
         return
@@ -276,14 +294,103 @@ def map_student_to_teacher_layer(student_layer_idx, L_T, L_S):
 
 
 def normalize_choose_align(choose_align):
-    """Normalize CLI value to BI | 1-1 | 1-all."""
+    """Normalize CLI value to BI | 1-1 | 1-all | 1-random."""
     s = (choose_align or "BI").strip()
     upper = s.upper()
     if upper in ("1-1", "1_1", "11", "DEPTH", "DEPTH-RATIO", "DEPTH_RATIO"):
         return "1-1"
     if upper in ("1-ALL", "1_ALL", "ALP", "ALP-KD", "ALPKD"):
         return "1-all"
+    if upper in ("1-RANDOM", "1_RANDOM", "RAIL", "RAIL-KD", "RAIL_KD", "RAILKD"):
+        return "1-random"
     return "BI"
+
+
+def criterion_supports_rail_kd_align(criterion_name):
+    """RAIL_KD layer pairing is only enabled for DSKDv2+IMPACT."""
+    return (criterion_name or "") in (
+        "dual_space_kd_v2_impact",
+        "dual_space_kd_v2_ipact",
+    )
+
+
+def sample_rail_kd_teacher_layers(L_T, L_S, seed=None, no_random=False):
+    """GLMKD ``RAIL_KD.get_teacher_hook``: sorted random teacher layers for 1:1 student pairing.
+
+    Samples ``min(L_S - 1, L_T)`` distinct indices from ``{1, ..., L_T}`` (same count rule as
+    ``random.sample(range(1, teacher_num_layers), num_layers - 1)``), then pairs student
+    layer ``m`` with the ``m``-th sampled teacher layer (``m = 1 .. L_S``), holding the last
+    teacher index for any extra student depth when ``L_S`` exceeds the sample size.
+    """
+    if L_T < 1 or L_S < 1:
+        return [1]
+
+    n_sample = min(max(L_S - 1, 1), L_T)
+    if no_random:
+        step = max(L_T // max(L_S, 1), 1)
+        layers = [min(1 + i * step, L_T) for i in range(n_sample)]
+    else:
+        rng = random.Random(seed)
+        pool = list(range(1, L_T + 1))
+        if len(pool) >= n_sample:
+            layers = sorted(rng.sample(pool, n_sample))
+        else:
+            layers = sorted(rng.choices(pool, k=n_sample))
+
+    if len(layers) < L_S:
+        layers = layers + [layers[-1]] * (L_S - len(layers))
+    return layers[:L_S]
+
+
+def build_rail_kd_alignment_pairs(L_T, L_S, seed=None, no_random=False):
+    """Build (teacher, student, weight) triples for ``choose_align=1-random`` (RAIL_KD)."""
+    teacher_layers = sample_rail_kd_teacher_layers(
+        L_T, L_S, seed=seed, no_random=no_random
+    )
+    weight = 1.0 / max(L_S, 1)
+    pairs = [
+        (teacher_layers[m - 1], m, weight) for m in range(1, L_S + 1)
+    ]
+    return pairs, "1-random", "RAIL_KD"
+
+
+def compute_alp_kd_attention_weights(student_hidden_states, teacher_hidden_states, W_proj, L_T, L_S):
+    """ALP-KD layer attention (GLMKD ``ALP_KD.inter_loss``).
+
+    For each student layer, softmax over all teacher layers using dot-product
+    scores between the first-token (CLS) hidden states. Teacher CLS is projected
+    to student dim via ``W_proj`` (cross-tokenizer), matching GLMKD when hidden
+    sizes differ.
+
+    Returns:
+        alpha: [B, L_S, L_T] with sum over L_T = 1 per student layer.
+    """
+    device = student_hidden_states[1].device
+    W = W_proj.to(device=device, dtype=torch.float32)
+    s_cls = torch.stack(
+        [student_hidden_states[m][:, 0, :].float() for m in range(1, L_S + 1)],
+        dim=1,
+    )
+    t_cls = torch.stack(
+        [(teacher_hidden_states[l][:, 0, :].float() @ W) for l in range(1, L_T + 1)],
+        dim=1,
+    )
+    scores = torch.bmm(s_cls, t_cls.transpose(1, 2))
+    return F.softmax(scores, dim=-1)
+
+
+def fuse_teacher_hidden_by_attention(teacher_hidden_states, alpha_bt, L_T):
+    """Fused teacher hidden H^C = sum_l alpha_l * H_T^l (ALP-KD Eq. 5–6 style).
+
+    Args:
+        alpha_bt: [B, L_T] weights for one student layer.
+    """
+    fused = None
+    for l in range(1, L_T + 1):
+        h = teacher_hidden_states[l]
+        w = alpha_bt[:, l - 1].view(-1, 1, 1).to(device=h.device, dtype=h.dtype)
+        fused = h * w if fused is None else fused + h * w
+    return fused
 
 
 def build_impact_alignment_pairs(
@@ -298,18 +405,32 @@ def build_impact_alignment_pairs(
     teacher_labels=None,
     padding_id=-100,
     random_seed=None,
+    rail_teacher_layers=None,
+    rail_kd_no_random=False,
 ):
     """Build (teacher_layer, student_layer, weight) triples for BPIA aggregation.
 
     choose_align:
       - BI: top-K teacher layers (choose_layer), BI/PPL softmax weights, g(l) depth map
       - 1-1: every student layer m paired with teacher ceil(m*L_T/L_S), uniform 1/L_S
-      - 1-all: last student layer L_S paired with every teacher layer, uniform 1/L_T
-        (ICARE align ablation / simplified ALP-KD one-to-all)
+      - 1-all: not used here — handled in ``compute_impact_loss`` via ALP-KD attention
+      - 1-random: RAIL_KD (GLMKD) sorted random teacher layers, 1:1 with student depth
     """
     align_mode = normalize_choose_align(choose_align)
-    device = teacher_hidden_states[1].device
     pairs = []
+
+    if align_mode == "1-random":
+        if rail_teacher_layers is not None:
+            weight = 1.0 / max(L_S, 1)
+            layers = list(rail_teacher_layers)
+            if len(layers) < L_S:
+                layers = layers + [layers[-1]] * (L_S - len(layers))
+            layers = layers[:L_S]
+            pairs = [(layers[m - 1], m, weight) for m in range(1, L_S + 1)]
+            return pairs, align_mode, "RAIL_KD"
+        return build_rail_kd_alignment_pairs(
+            L_T, L_S, seed=random_seed, no_random=rail_kd_no_random
+        )
 
     if align_mode == "1-1":
         weight = 1.0 / max(L_S, 1)
@@ -319,11 +440,10 @@ def build_impact_alignment_pairs(
         return pairs, align_mode, None
 
     if align_mode == "1-all":
-        m = L_S
-        weight = 1.0 / max(L_T, 1)
-        for l in range(1, L_T + 1):
-            pairs.append((l, m, weight))
-        return pairs, align_mode, None
+        raise RuntimeError(
+            "choose_align=1-all uses ALP-KD fused teacher states in compute_impact_loss; "
+            "do not call build_impact_alignment_pairs for 1-all."
+        )
 
     selected, alpha, layer_mode, _ = select_teacher_layers_and_weights(
         choose_layer,
@@ -469,13 +589,36 @@ def compute_student_increments(student_hidden, student_mask):
     return increments
 
 
+def _log_alp_kd_alignment(alpha, L_S, L_T):
+    """Log ALP-KD attention (sample student layers, batch 0)."""
+    try:
+        from utils import log_rank
+    except ImportError:
+        return
+    b0 = 0
+    samples = sorted({1, max(1, L_S // 2), L_S})
+    parts = []
+    for m in samples:
+        w = alpha[b0, m - 1].detach().float().cpu().tolist()
+        ranked = sorted(enumerate(w, start=1), key=lambda x: -x[1])
+        top5 = [(l, round(a, 4)) for l, a in ranked[:5]]
+        parts.append(f"s{m}:{top5}")
+    log_rank(
+        "[IMPACT align] mode=1-all (ALP-KD, GLMKD ALP_KD) L_S={} L_T={} num_student_layers={} "
+        "attn_softmax_over_teacher batch0_samples: {}".format(
+            L_S, L_T, L_S, "; ".join(parts)
+        )
+    )
+
+
 def compute_impact_loss(student_hidden_states, teacher_hidden_states,
                        student_offsets_batch, teacher_offsets_batch,
                        W_proj, student_mask, teacher_mask,
                        top_k=4, bi_tau=1.0, L_T=None, L_S=None,
                        choose_layer="BI", choose_align="BI",
                        teacher_model=None, teacher_labels=None,
-                       padding_id=-100, random_seed=None, log_selection=False):
+                       padding_id=-100, random_seed=None, log_selection=False,
+                       rail_teacher_layers=None, rail_kd_no_random=False):
     """Compute the full IMPACT (BPIA) loss.
 
     L_BPIA = sum_pairs w * (1/N) * sum_i (1 - cos(Delta_S, Delta_T))
@@ -492,7 +635,7 @@ def compute_impact_loss(student_hidden_states, teacher_hidden_states,
         top_k: number of teacher layers to select (BI align only)
         bi_tau: temperature for BI score softmax (BI align only)
         choose_layer: teacher layer selection when choose_align=BI
-        choose_align: BI | 1-1 | 1-all
+        choose_align: BI | 1-1 | 1-all | 1-random (1-random = GLMKD RAIL_KD pairing)
         L_T: number of teacher layers (excluding embedding)
         L_S: number of student layers (excluding embedding)
 
@@ -503,6 +646,40 @@ def compute_impact_loss(student_hidden_states, teacher_hidden_states,
         L_T = len(teacher_hidden_states) - 1
     if L_S is None:
         L_S = len(student_hidden_states) - 1
+
+    align_mode = normalize_choose_align(choose_align)
+    if align_mode == "1-all":
+        if W_proj is None:
+            raise ValueError("ALP-KD (choose_align=1-all) requires vocabulary projection W_proj")
+        alpha = compute_alp_kd_attention_weights(
+            student_hidden_states, teacher_hidden_states, W_proj, L_T, L_S
+        )
+        if log_selection:
+            _log_alp_kd_alignment(alpha, L_S, L_T)
+
+        device = student_hidden_states[0].device
+        total_loss = torch.tensor(0.0, device=device)
+        mask_float = student_mask.float()
+        N = mask_float.sum(dim=1).clamp(min=1)
+        layer_weight = 1.0 / max(L_S, 1)
+
+        for m in range(1, L_S + 1):
+            s_hidden = student_hidden_states[m]
+            t_fused = fuse_teacher_hidden_by_attention(
+                teacher_hidden_states, alpha[:, m - 1, :], L_T
+            )
+            delta_T = compute_teacher_increments_batch(
+                student_offsets_batch, teacher_offsets_batch,
+                t_fused, W_proj, student_mask, teacher_mask
+            )
+            delta_S = compute_student_increments(s_hidden, student_mask)
+            cos_sim = F.cosine_similarity(
+                delta_S.float(), delta_T.float(), dim=-1, eps=1e-6
+            )
+            cos_loss = (1.0 - cos_sim) * mask_float
+            layer_loss = (cos_loss.sum(dim=1) / N).mean()
+            total_loss = total_loss + layer_weight * layer_loss
+        return total_loss
 
     pairs, align_mode, layer_mode = build_impact_alignment_pairs(
         choose_align,
@@ -516,6 +693,8 @@ def compute_impact_loss(student_hidden_states, teacher_hidden_states,
         teacher_labels=teacher_labels,
         padding_id=padding_id,
         random_seed=random_seed,
+        rail_teacher_layers=rail_teacher_layers,
+        rail_kd_no_random=rail_kd_no_random,
     )
 
     if log_selection:
@@ -531,6 +710,8 @@ def compute_impact_loss(student_hidden_states, teacher_hidden_states,
             ).format(align_mode, len(pairs), t_layers, s_layers, weights)
             if layer_mode is not None:
                 msg += " layer_select={}".format(layer_mode)
+            if align_mode == "1-random" and rail_teacher_layers is not None:
+                msg += " rail_sample={}".format(list(rail_teacher_layers)[:L_S])
             log_rank(msg)
         except ImportError:
             pass
@@ -581,9 +762,27 @@ class IMPACTModule(nn.Module):
         self.choose_align = getattr(args, "impact_choose_align", None) or getattr(
             args, "choose_align", "BI"
         )
+        align_mode = normalize_choose_align(self.choose_align)
+        self._criterion_name = getattr(args, "criterion", None) or "IMPACT"
+        if align_mode == "1-random" and not criterion_supports_rail_kd_align(
+            self._criterion_name
+        ):
+            raise ValueError(
+                "choose_align=1-random (RAIL_KD) is only supported for "
+                "criterion=dual_space_kd_v2_impact (DSKDv2_IMPACT)."
+            )
+        self.rail_kd_epochs = int(getattr(args, "impact_rail_kd_epochs", 1))
+        self.rail_kd_iters = int(getattr(args, "impact_rail_kd_iters", 0))
+        self.rail_kd_no_random = bool(getattr(args, "impact_rail_kd_no_random", False))
+        self.rail_kd_show_layers = bool(
+            getattr(args, "impact_rail_kd_show_layers", False)
+        )
+        self._rail_teacher_layers = None
+        self._rail_last_epoch = -1
+        self._rail_last_iter_bucket = -1
+        self._rail_forward_step = 0
         self.padding_id = getattr(args, "padding_id", -100)
         self.random_seed = getattr(args, "seed", None)
-        self._criterion_name = getattr(args, "criterion", None) or "IMPACT"
         self._W_proj = None
         self._initialized = False
         self._layer_select_logged = False
@@ -591,7 +790,7 @@ class IMPACTModule(nn.Module):
     def _ensure_initialized(self, distiller):
         if self._initialized:
             return
-        teacher_tok = distiller.teacher_tokenizers.get(distiller.teacher_model_type)
+        teacher_tok = resolve_teacher_tokenizer(distiller)
         if teacher_tok is None:
             return
         log_impact_vocab_overlap(
@@ -607,6 +806,54 @@ class IMPACTModule(nn.Module):
         self._W_proj = self._W_proj_buf
         self._initialized = True
 
+    def _maybe_resample_rail_layers(self, L_T, L_S, distiller):
+        """Resample RAIL_KD teacher layers (GLMKD: each epoch or every N iters)."""
+        train_epoch = int(
+            getattr(getattr(distiller, "args", None), "current_train_epoch", 0)
+        )
+        global_step = int(
+            getattr(getattr(distiller, "args", None), "current_global_step", 0)
+        )
+        self._rail_forward_step += 1
+        resample = self._rail_teacher_layers is None
+        bucket = (
+            global_step // max(self.rail_kd_iters, 1) if self.rail_kd_iters > 0 else 0
+        )
+
+        if self.rail_kd_iters > 0:
+            if bucket != self._rail_last_iter_bucket:
+                resample = True
+                self._rail_last_iter_bucket = bucket
+        elif self.rail_kd_epochs > 0:
+            if train_epoch != self._rail_last_epoch:
+                resample = True
+                self._rail_last_epoch = train_epoch
+
+        if resample:
+            if self.random_seed is None:
+                seed = None
+            elif self.rail_kd_iters > 0:
+                seed = int(self.random_seed) + train_epoch * 10007 + bucket
+            else:
+                seed = int(self.random_seed) + train_epoch * 10007
+            self._rail_teacher_layers = sample_rail_kd_teacher_layers(
+                L_T,
+                L_S,
+                seed=seed,
+                no_random=self.rail_kd_no_random,
+            )
+            if self.rail_kd_show_layers:
+                try:
+                    from utils import log_rank
+                    log_rank(
+                        "[IMPACT RAIL_KD] epoch={} step={} teacher_layers(1-based)={}".format(
+                            train_epoch, global_step, self._rail_teacher_layers
+                        )
+                    )
+                except ImportError:
+                    pass
+        return self._rail_teacher_layers
+
     def compute_loss(self, distiller, student_hidden_states, teacher_hidden_states,
                      student_offsets_batch, teacher_offsets_batch,
                      student_mask, teacher_mask, teacher_labels=None):
@@ -621,6 +868,10 @@ class IMPACTModule(nn.Module):
         L_T = len(teacher_hidden_states) - 1
         L_S = len(student_hidden_states) - 1
 
+        rail_layers = None
+        if normalize_choose_align(self.choose_align) == "1-random":
+            rail_layers = self._maybe_resample_rail_layers(L_T, L_S, distiller)
+
         loss = compute_impact_loss(
             student_hidden_states, teacher_hidden_states,
             student_offsets_batch, teacher_offsets_batch,
@@ -634,6 +885,8 @@ class IMPACTModule(nn.Module):
             padding_id=self.padding_id,
             random_seed=self.random_seed,
             log_selection=not self._layer_select_logged,
+            rail_teacher_layers=rail_layers,
+            rail_kd_no_random=self.rail_kd_no_random,
         )
         self._layer_select_logged = True
         return loss

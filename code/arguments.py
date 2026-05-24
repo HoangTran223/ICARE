@@ -213,9 +213,13 @@ def add_hp_args(parser: argparse.ArgumentParser):
         dest="impact_choose_align",
         type=str,
         default="BI",
-        choices=["BI", "1-1", "1-all"],
-        help="IMPACT layer alignment: BI, 1-1 (depth-ratio), 1-all (ALP-KD attention, GLMKD)",
+        choices=["BI", "1-1", "1-all", "1-random"],
+        help="IMPACT layer alignment: BI, 1-1, 1-all (ALP-KD), 1-random (RAIL_KD; dual_space_kd_v2_impact only)",
     )
+    group.add_argument("--impact-rail-kd-epochs", type=int, default=1)
+    group.add_argument("--impact-rail-kd-iters", type=int, default=0)
+    group.add_argument("--impact-rail-kd-no-random", action="store_true")
+    group.add_argument("--impact-rail-kd-show-layers", action="store_true")
 
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '

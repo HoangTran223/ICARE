@@ -166,10 +166,31 @@ def add_hp_args(parser: argparse.ArgumentParser):
         dest="impact_choose_align",
         type=str,
         default="BI",
-        choices=["BI", "1-1", "1-all"],
-        help="Layer alignment for IMPACT BPIA: BI (top-K + BI weights + depth), "
-        "1-1 (each student layer -> one teacher layer by depth ratio, uniform 1/L_S), "
-        "1-all (ALP-KD/GLMKD: each student layer -> softmax attention over all teacher layers, fused hidden)",
+        choices=["BI", "1-1", "1-all", "1-random"],
+        help="Layer alignment for IMPACT BPIA (dual_space_kd_v2_impact only for 1-random): "
+        "BI, 1-1 (depth ratio), 1-all (ALP-KD), 1-random (GLMKD RAIL_KD sorted random teacher layers)",
+    )
+    group.add_argument(
+        "--impact-rail-kd-epochs",
+        type=int,
+        default=1,
+        help="RAIL_KD (choose_align=1-random): resample random teacher layers every N epochs (default 1)",
+    )
+    group.add_argument(
+        "--impact-rail-kd-iters",
+        type=int,
+        default=0,
+        help="RAIL_KD: resample every N global steps if >0 (overrides impact-rail-kd-epochs when set)",
+    )
+    group.add_argument(
+        "--impact-rail-kd-no-random",
+        action="store_true",
+        help="RAIL_KD: fixed strided teacher layers instead of random sample (GLMKD rail_kd_no_random)",
+    )
+    group.add_argument(
+        "--impact-rail-kd-show-layers",
+        action="store_true",
+        help="RAIL_KD: log resampled teacher layer indices each refresh",
     )
 
     group.add_argument('--warmup-iters', type=int, default=0,

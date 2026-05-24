@@ -120,6 +120,7 @@ def finetune(
     for epoch in range(args.num_epochs):
         sampler.set_epoch(epoch)
         logging_output["epoch"] += 1
+        args.current_train_epoch = epoch + 1
         log_rank("Start iterations of epoch {}".format(epoch + 1))
         model.train()
         end_epoch = False
@@ -302,6 +303,7 @@ def finetune(
                 step += 1
 
             logging_output["global_step"] += 1
+            args.current_global_step = logging_output["global_step"]
             logging_output["step_time"].append(time.time() - global_st_time)
             epoch_step += 1
 

@@ -17,16 +17,29 @@ def uses_gradmag(multitask_aggregation_fn: str | None) -> bool:
     return multitask_aggregation_fn in GRADMAG_MODES
 
 
+def _unwrap_student_backbone(model: nn.Module) -> nn.Module:
+    """PeftModel wraps the causal LM at base_model.model."""
+    if hasattr(model, "base_model") and getattr(model.base_model, "model", None) is not None:
+        return model.base_model.model
+    return model
+
+
 def get_last_layer_params(model: nn.Module, model_type: str) -> List[torch.nn.Parameter]:
     """Last transformer block only (tokenkit get_layer_n_mask(..., -1); gpt2: transformer.h[-1])."""
+    backbone = _unwrap_student_backbone(model)
     if model_type in ("gpt2", "gptj"):
-        layer_params = list(model.transformer.h[-1].parameters())
-    elif hasattr(model, "model") and hasattr(model.model, "layers"):
-        layer_params = list(model.model.layers[-1].parameters())
-    elif hasattr(model, "transformer") and hasattr(model.transformer, "layers"):
-        layer_params = list(model.transformer.layers[-1].parameters())
-    elif hasattr(model, "gpt_neox") and hasattr(model.gpt_neox, "layers"):
-        layer_params = list(model.gpt_neox.layers[-1].parameters())
+        layer_params = list(backbone.transformer.h[-1].parameters())
+    elif hasattr(backbone, "model") and hasattr(backbone.model, "layers"):
+        layer_params = list(backbone.model.layers[-1].parameters())
+    elif hasattr(backbone, "transformer") and hasattr(backbone.transformer, "layers"):
+        layer_params = list(backbone.transformer.layers[-1].parameters())
+    elif hasattr(backbone, "gpt_neox") and hasattr(backbone.gpt_neox, "layers"):
+        layer_params = list(backbone.gpt_neox.layers[-1].parameters())
+    elif model_type in ("tinyllama", "llama", "llama2", "mistral", "minicpm"):
+        raise ValueError(
+            f"Cannot resolve last-layer parameters for model_type={model_type!r} "
+            f"(backbone={type(backbone).__name__}). Extend get_last_layer_params in code/alm_multitask.py."
+        )
     else:
         raise ValueError(
             f"Cannot resolve last-layer parameters for model_type={model_type!r}. "
